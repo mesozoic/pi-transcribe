@@ -1,5 +1,5 @@
-import { CustomEditor, type ExtensionAPI, type ExtensionContext, type KeybindingsManager, type Theme } from "@mariozechner/pi-coding-agent";
-import type { EditorTheme, TUI } from "@mariozechner/pi-tui";
+import { CustomEditor, type EditorFactory, type ExtensionAPI, type ExtensionContext, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
+import { matchesKey, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 
 import { loadConfig } from "./config.js";
 import { AudioCapture } from "./audio.js";
@@ -19,6 +19,8 @@ export default function (pi: ExtensionAPI) {
   let dictation: DictationSession | null = null;
   let pvrecorderAvailable = true;
   let currentCtx: ExtensionContext | null = null;
+  /** Editor factory configured before we installed ours — restored on shutdown */
+  let previousEditorFactory: EditorFactory | undefined;
 
   // Check pvrecorder availability (deferred to session_start via dynamic import)
 
@@ -51,7 +53,10 @@ export default function (pi: ExtensionAPI) {
     }
 
 
-    // Install our custom editor that detects spacebar hold
+    // Install our custom editor that detects spacebar hold.
+    // Remember whatever factory was configured before us (another extension,
+    // or undefined for the default editor) so we can restore it on shutdown.
+    previousEditorFactory = ctx.ui.getEditorComponent();
     ctx.ui.setEditorComponent((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => {
       const editor = new DictationEditor(tui, theme, keybindings, {
         onRecordingStart: () => startDictation(ctx, editor),
@@ -77,6 +82,9 @@ export default function (pi: ExtensionAPI) {
     dictation = null;
     ctx.ui.setStatus("pi-transcribe", undefined);
     ctx.ui.setWidget("pi-transcribe", undefined);
+    // Restore the previously configured editor (undefined = default editor)
+    ctx.ui.setEditorComponent(previousEditorFactory);
+    previousEditorFactory = undefined;
     currentCtx = null;
   });
 
@@ -226,7 +234,8 @@ class DictationEditor extends CustomEditor {
 
   handleInput(data: string): void {
     // Escape cancels active recording
-    if (data === "\x1b" && this.isRecording) {
+    // (matchesKey handles both legacy \x1b and Kitty-protocol escape sequences)
+    if (matchesKey(data, "escape") && this.isRecording) {
       this.onSpaceRelease();
       this.callbacks.onRecordingCancel?.();
       return;

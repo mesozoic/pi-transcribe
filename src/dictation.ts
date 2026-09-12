@@ -1,5 +1,5 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { TUI } from "@mariozechner/pi-tui";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
 import type { TranscribeConfig } from "./config.js";
 import type { AudioCapture } from "./audio.js";
 import type { TranscriptionEngine } from "./recognizer.js";
