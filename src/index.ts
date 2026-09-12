@@ -228,7 +228,9 @@ class DictationEditor extends CustomEditor {
     onRecordingCancel?: () => void;
     pvrecorderAvailable: boolean;
   }) {
-    super(tui, theme, keybindings);
+    // embedWorkingStatus: render the working spinner in the editor border,
+    // matching the default editor (otherwise it shows as a row in the transcript)
+    super(tui, theme, keybindings, { embedWorkingStatus: true });
     this.callbacks = callbacks;
   }
 
