@@ -36,6 +36,9 @@ export class DictationSession {
   /** UI refs */
   private tui: TUI | null = null;
 
+  /** Called when the session tears itself down (e.g. microphone error), so the UI can clear its state */
+  onCleanup?: () => void;
+
   constructor(
     audioCapture: AudioCapture,
     engine: TranscriptionEngine,
@@ -123,8 +126,8 @@ export class DictationSession {
       (err: Error) => {
         ctx.ui.notify(`Microphone error: ${err.message}`, "error");
         this.cleanup();
-        ctx.ui.setWidget("pi-transcribe", undefined);
         ctx.ui.setStatus("pi-transcribe", undefined);
+        this.onCleanup?.();
       }
     );
   }

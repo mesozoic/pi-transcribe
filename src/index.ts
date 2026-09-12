@@ -1,5 +1,5 @@
 import { CustomEditor, type EditorFactory, type ExtensionAPI, type ExtensionContext, type KeybindingsManager, type Theme } from "@earendil-works/pi-coding-agent";
-import { matchesKey, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 
 import { loadConfig } from "./config.js";
 import { AudioCapture } from "./audio.js";
@@ -21,6 +21,8 @@ export default function (pi: ExtensionAPI) {
   let currentCtx: ExtensionContext | null = null;
   /** Editor factory configured before we installed ours — restored on shutdown */
   let previousEditorFactory: EditorFactory | undefined;
+  /** The live editor instance (recreated by the app on theme changes etc.) */
+  let activeEditor: DictationEditor | null = null;
 
   // Check pvrecorder availability (deferred to session_start via dynamic import)
 
@@ -64,12 +66,14 @@ export default function (pi: ExtensionAPI) {
         onRecordingCancel: () => {
           if (!dictation?.isActive) return;
           dictation.cancel(ctx);
-          ctx.ui.setWidget("pi-transcribe", undefined);
+          editor.setDictationStatus(null);
           ctx.ui.setStatus("pi-transcribe", undefined);
           dictation = null;
         },
         pvrecorderAvailable,
+        getTheme: () => ctx.ui.theme,
       });
+      activeEditor = editor;
       return editor;
     });
   });
@@ -81,10 +85,10 @@ export default function (pi: ExtensionAPI) {
     audioCapture = null;
     dictation = null;
     ctx.ui.setStatus("pi-transcribe", undefined);
-    ctx.ui.setWidget("pi-transcribe", undefined);
     // Restore the previously configured editor (undefined = default editor)
     ctx.ui.setEditorComponent(previousEditorFactory);
     previousEditorFactory = undefined;
+    activeEditor = null;
     currentCtx = null;
   });
 
@@ -126,48 +130,17 @@ export default function (pi: ExtensionAPI) {
       await audioCapture.ensureLoaded();
 
       dictation = new DictationSession(audioCapture, engine, config);
+      // If the session tears itself down (e.g. microphone error), clear the editor status
+      dictation.onCleanup = () => activeEditor?.setDictationStatus(null);
       dictation.start(ctx);
 
       ctx.ui.setStatus("pi-transcribe", "🎤 Recording");
-
-      // Widget shows live waveform
-      ctx.ui.setWidget("pi-transcribe", (tui: TUI, theme: Theme) => {
-        if (dictation) {
-          dictation.setTui(tui);
-        }
-
-        return {
-          render: (width: number) => {
-            if (!dictation) return [""];
-
-            const elapsed = dictation.getElapsedTime();
-            const label = "🎤 ";
-            const time = ` ${elapsed} `;
-            const hint = " ␣ release to transcribe · Esc cancel";
-
-            const fixedWidth = label.length + time.length + hint.length + 2;
-            const barCount = Math.max(10, Math.min(50, width - fixedWidth));
-            const bars = dictation.getWaveformBars(barCount);
-
-            const waveStr = bars.map(bar =>
-              bar === " "
-                ? theme.fg("dim", bar)
-                : theme.fg("accent", bar)
-            ).join("");
-
-            const line = theme.fg("accent", label)
-              + waveStr
-              + theme.fg("muted", time)
-              + theme.fg("dim", hint);
-
-            return [line];
-          },
-          invalidate: () => {},
-        };
-      }, { placement: "belowEditor" });
+      // Status (live waveform, elapsed time, hints) renders in the editor's
+      // bottom border instead of a widget line beneath the editor
+      (editor ?? activeEditor)?.setDictationStatus("recording", dictation);
     } catch (e: any) {
       ctx.ui.notify(`Failed to start recording: ${e.message}`, "error");
-      ctx.ui.setWidget("pi-transcribe", undefined);
+      (editor ?? activeEditor)?.setDictationStatus(null);
       ctx.ui.setStatus("pi-transcribe", undefined);
       dictation = null;
     }
@@ -176,29 +149,28 @@ export default function (pi: ExtensionAPI) {
   async function stopDictation(ctx: ExtensionContext, editor?: DictationEditor) {
     if (!dictation?.isActive) return;
 
+    // Fall back to the live editor so the ctrl+shift+r path also gets
+    // in-border status and cursor insertion
+    const targetEditor = editor ?? activeEditor;
+
     ctx.ui.setStatus("pi-transcribe", "✨ Transcribing...");
-    ctx.ui.setWidget("pi-transcribe", (_tui: TUI, theme: Theme) => ({
-      render: () => [theme.fg("accent", "✨ Transcribing audio...")],
-      invalidate: () => {},
-    }), { placement: "belowEditor" });
+    targetEditor?.setDictationStatus("transcribing");
 
     try {
       const text = await dictation.stop(ctx);
 
       // Insert transcribed text at cursor position (instead of appending to editor)
-      if (text && text.length > 0 && editor) {
-        editor.insertTextAtCursor(text);
+      if (text && text.length > 0 && targetEditor) {
+        targetEditor.insertTextAtCursor(text);
       }
     } catch (e: any) {
       ctx.ui.notify(`Transcription error: ${e.message}`, "error");
     }
 
-    ctx.ui.setWidget("pi-transcribe", undefined);
+    targetEditor?.setDictationStatus(null);
     ctx.ui.setStatus("pi-transcribe", undefined);
     dictation = null;
   }
-
-
 }
 
 /**
@@ -215,11 +187,14 @@ class DictationEditor extends CustomEditor {
   private consecutiveSpaces = 0;
   private releaseTimer: ReturnType<typeof setTimeout> | null = null;
   private isRecording = false;
+  private dictationStatus: "recording" | "transcribing" | null = null;
+  private session: DictationSession | null = null;
   private callbacks: {
     onRecordingStart: () => void;
     onRecordingStop: () => void;
     onRecordingCancel?: () => void;
     pvrecorderAvailable: boolean;
+    getTheme: () => Theme;
   };
 
   constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, callbacks: {
@@ -227,11 +202,79 @@ class DictationEditor extends CustomEditor {
     onRecordingStop: () => void;
     onRecordingCancel?: () => void;
     pvrecorderAvailable: boolean;
+    getTheme: () => Theme;
   }) {
     // embedWorkingStatus: render the working spinner in the editor border,
     // matching the default editor (otherwise it shows as a row in the transcript)
     super(tui, theme, keybindings, { embedWorkingStatus: true });
     this.callbacks = callbacks;
+  }
+
+  /**
+   * Show dictation status in place of the text entry line while recording or
+   * transcribing. Pass the session for live waveform/elapsed time; null
+   * restores normal text editing.
+   */
+  setDictationStatus(status: "recording" | "transcribing" | null, session?: DictationSession): void {
+    this.dictationStatus = status;
+    if (session) {
+      this.session = session;
+      // Let the session trigger re-renders so the waveform and timer animate
+      session.setTui(this.tui);
+    } else if (!status) {
+      this.session = null;
+    }
+    this.tui.requestRender();
+  }
+
+  override render(width: number): string[] {
+    if (!this.dictationStatus) {
+      return super.render(width);
+    }
+
+    // Keep the base layout/scroll bookkeeping fresh (so the editor snaps back
+    // to the right state when the status clears), but discard its output —
+    // the status takes over the text entry line while dictation is active.
+    super.render(width);
+
+    const theme = this.callbacks.getTheme();
+
+    let status: string;
+    if (this.dictationStatus === "transcribing") {
+      status = theme.fg("accent", "✨ Transcribing audio...");
+    } else {
+      const label = "🎤 ";
+      const time = ` ${this.session?.getElapsedTime() ?? "00:00"} `;
+      const hint = " ␣ release to transcribe · Esc cancel";
+
+      // Emoji width is approximate, so pad the budget generously
+      const fixedWidth = label.length + time.length + hint.length + 4;
+      const barCount = Math.max(10, Math.min(50, width - fixedWidth));
+      const bars = this.session?.getWaveformBars(barCount) ?? [];
+
+      const waveStr = bars.map(bar =>
+        bar === " "
+          ? theme.fg("dim", bar)
+          : theme.fg("accent", bar)
+      ).join("");
+
+      status = theme.fg("accent", label)
+        + waveStr
+        + theme.fg("muted", time)
+        + theme.fg("dim", hint);
+    }
+
+    const statusWidth = visibleWidth(status);
+    const line = statusWidth > width
+      ? truncateToWidth(status, width)
+      : status + " ".repeat(width - statusWidth);
+
+    // Same 3-line box as the normal editor: status sits where the text would be
+    return [
+      this.renderTopBorder(width, 0),
+      line,
+      this.renderBottomBorder(width, 0),
+    ];
   }
 
   handleInput(data: string): void {
