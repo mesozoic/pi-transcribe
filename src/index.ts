@@ -161,7 +161,7 @@ export default function (pi: ExtensionAPI) {
 
       // Insert transcribed text at cursor position (instead of appending to editor)
       if (text && text.length > 0 && targetEditor) {
-        targetEditor.insertTextAtCursor(text);
+        targetEditor.insertDictatedText(text);
       }
     } catch (e: any) {
       ctx.ui.notify(`Transcription error: ${e.message}`, "error");
@@ -181,7 +181,7 @@ export default function (pi: ExtensionAPI) {
  * we switch to recording mode and consume further spaces.
  * When spaces stop arriving (SPACE_RELEASE_MS timeout), we stop recording.
  */
-class DictationEditor extends CustomEditor {
+export class DictationEditor extends CustomEditor {
   private lastSpaceTime = 0;
   private rapidCount = 0;
   private consecutiveSpaces = 0;
@@ -225,6 +225,18 @@ class DictationEditor extends CustomEditor {
       this.session = null;
     }
     this.tui.requestRender();
+  }
+
+  /**
+   * Insert transcribed text at the cursor, adding a separating space when the
+   * text before the cursor doesn't end in whitespace — so dictated text never
+   * runs onto the previous sentence.
+   */
+  insertDictatedText(text: string): void {
+    const { line, col } = this.getCursor();
+    const beforeCursor = (this.getLines()[line] ?? "").slice(0, col);
+    const needsSpace = beforeCursor.length > 0 && !/\s$/.test(beforeCursor) && !/^\s/.test(text);
+    this.insertTextAtCursor(needsSpace ? " " + text : text);
   }
 
   override render(width: number): string[] {
@@ -311,9 +323,12 @@ class DictationEditor extends CustomEditor {
       this.consecutiveSpaces++;
 
       if (this.rapidCount >= SPACE_TRIGGER_COUNT) {
-        // Trigger! Remove ALL consecutive trailing spaces and start recording
+        // Trigger! Remove only the hold-generated spaces (the rapid auto-repeat
+        // stream) and start recording. Spaces the user typed deliberately —
+        // e.g. after a sentence — are preserved so dictation doesn't create
+        // run-ons with previous text.
         const text = this.getText();
-        const toRemove = Math.min(this.consecutiveSpaces, text.length);
+        const toRemove = Math.min(this.rapidCount, text.length);
         if (toRemove > 0 && text.slice(-toRemove) === " ".repeat(toRemove)) {
           this.setText(text.slice(0, -toRemove));
         }
